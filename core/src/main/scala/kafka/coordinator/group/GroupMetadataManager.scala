@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 
 import com.yammer.metrics.core.Gauge
-import kafka.api.{ApiVersion, KAFKA_0_10_1_IV0, KAFKA_2_1_IV0, KAFKA_2_1_IV1, KAFKA_2_2_IV0, KAFKA_2_3_IV0}
+import kafka.api.{ApiVersion, KAFKA_0_10_1_IV0, KAFKA_2_1_IV0, KAFKA_2_1_IV1, KAFKA_2_3_IV0}
 import kafka.common.{MessageFormatter, OffsetAndMetadata}
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server.ReplicaManager
@@ -40,13 +40,13 @@ import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.protocol.types.Type._
 import org.apache.kafka.common.protocol.types._
 import org.apache.kafka.common.record._
-import org.apache.kafka.common.requests.{JoinGroupRequest, OffsetCommitRequest, OffsetFetchResponse}
+import org.apache.kafka.common.requests.{OffsetCommitRequest, OffsetFetchResponse}
 import org.apache.kafka.common.requests.ProduceResponse.PartitionResponse
 import org.apache.kafka.common.utils.{Time, Utils}
 
 import scala.collection.JavaConverters._
 import scala.collection._
-import scala.collection.mutable.ListBuffer
+import scala.collection.mutable.ArrayBuffer
 
 class GroupMetadataManager(brokerId: Int,
                            interBrokerProtocolVersion: ApiVersion,
@@ -312,7 +312,7 @@ class GroupMetadataManager(brokerId: Int,
     // construct the message set to append
     if (filteredOffsetMetadata.isEmpty) {
       // compute the final error codes for the commit response
-      val commitStatus = offsetMetadata.mapValues(_ => Errors.OFFSET_METADATA_TOO_LARGE)
+      val commitStatus = offsetMetadata.map { case (k, v) => k -> Errors.OFFSET_METADATA_TOO_LARGE }
       responseCallback(commitStatus)
       None
     } else {
@@ -757,7 +757,7 @@ class GroupMetadataManager(brokerId: Int,
         val timestamp = time.milliseconds()
 
           replicaManager.nonOfflinePartition(appendPartition).foreach { partition =>
-            val tombstones = ListBuffer.empty[SimpleRecord]
+            val tombstones = ArrayBuffer.empty[SimpleRecord]
             removedOffsets.foreach { case (topicPartition, offsetAndMetadata) =>
               trace(s"Removing expired/deleted offset and metadata for $groupId, $topicPartition: $offsetAndMetadata")
               val commitKey = GroupMetadataManager.offsetCommitKey(groupId, topicPartition)
@@ -780,7 +780,7 @@ class GroupMetadataManager(brokerId: Int,
               try {
                 // do not need to require acks since even if the tombstone is lost,
                 // it will be appended again in the next purge cycle
-                val records = MemoryRecords.withRecords(magicValue, 0L, compressionType, timestampType, tombstones: _*)
+                val records = MemoryRecords.withRecords(magicValue, 0L, compressionType, timestampType, tombstones.toArray: _*)
                 partition.appendRecordsToLeader(records, isFromClient = false, requiredAcks = 0)
 
                 offsetsRemoved += removedOffsets.size
@@ -1078,7 +1078,7 @@ object GroupMetadataManager {
     val schemaOpt = MESSAGE_TYPE_SCHEMAS.get(version)
     schemaOpt match {
       case Some(schema) => schema
-      case _ => throw new KafkaException("Unknown offset schema version " + version)
+      case _ => throw new KafkaException("Unknown message key schema version " + version)
     }
   }
 

@@ -57,6 +57,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -602,15 +603,6 @@ public final class Utils {
     }
 
     /**
-     * Print an error message and shutdown the JVM
-     * @param message The error message
-     */
-    public static void croak(String message) {
-        System.err.println(message);
-        Exit.exit(1);
-    }
-
-    /**
      * Read a buffer into a Byte array for the given offset and length
      */
     public static byte[] readBytes(ByteBuffer buffer, int offset, int length) {
@@ -857,6 +849,17 @@ public final class Utils {
         }
     }
 
+    public static void closeQuietly(AutoCloseable closeable, String name, AtomicReference<Throwable> firstException) {
+        if (closeable != null) {
+            try {
+                closeable.close();
+            } catch (Throwable t) {
+                firstException.compareAndSet(null, t);
+                log.error("Failed to close {} with type {}", name, closeable.getClass().getName(), t);
+            }
+        }
+    }
+
     /**
      * A cheap way to deterministically convert a number to a positive value. When the input is
      * positive, the original value is returned. When the input number is negative, the returned
@@ -872,10 +875,6 @@ public final class Utils {
      */
     public static int toPositive(int number) {
         return number & 0x7fffffff;
-    }
-
-    public static int longHashcode(long value) {
-        return (int) (value ^ (value >>> 32));
     }
 
     /**

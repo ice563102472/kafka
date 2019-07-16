@@ -16,7 +16,6 @@
  */
 package org.apache.kafka.clients.producer.internals;
 
-import java.util.ArrayList;
 import org.apache.kafka.clients.ApiVersions;
 import org.apache.kafka.clients.ClientRequest;
 import org.apache.kafka.clients.ClientResponse;
@@ -33,11 +32,9 @@ import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.errors.ClusterAuthorizationException;
 import org.apache.kafka.common.errors.InvalidMetadataException;
 import org.apache.kafka.common.errors.OutOfOrderSequenceException;
-import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.errors.RetriableException;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.errors.TopicAuthorizationException;
-import org.apache.kafka.common.errors.TransactionalIdAuthorizationException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.message.InitProducerIdRequestData;
@@ -60,6 +57,7 @@ import org.apache.kafka.common.utils.Utils;
 import org.slf4j.Logger;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -237,7 +235,7 @@ public class Sender implements Runnable {
         // main loop, runs until close is called
         while (running) {
             try {
-                run(time.milliseconds());
+                runOnce();
             } catch (Exception e) {
                 log.error("Uncaught error in kafka producer I/O thread: ", e);
             }
@@ -250,7 +248,7 @@ public class Sender implements Runnable {
         // wait until these are completed.
         while (!forceClose && ((this.accumulator.hasUndrained() || this.client.inFlightRequestCount() > 0) || hasPendingTransactionalRequests())) {
             try {
-                run(time.milliseconds());
+                runOnce();
             } catch (Exception e) {
                 log.error("Uncaught error in kafka producer I/O thread: ", e);
             }
@@ -263,7 +261,7 @@ public class Sender implements Runnable {
                 transactionManager.beginAbort();
             }
             try {
-                run(time.milliseconds());
+                runOnce();
             } catch (Exception e) {
                 log.error("Uncaught error in kafka producer I/O thread: ", e);
             }
@@ -291,14 +289,12 @@ public class Sender implements Runnable {
     /**
      * Run a single iteration of sending
      *
-     * @param now The current POSIX time in milliseconds
      */
-    void run(long now) {
+    void runOnce() {
         if (transactionManager != null) {
             try {
-                if (transactionManager.shouldResetProducerStateAfterResolvingSequences())
-                    // Check if the previous run expired batches which requires a reset of the producer state.
-                    transactionManager.resetProducerId();
+                transactionManager.resetProducerIdIfNeeded();
+
                 if (!transactionManager.isTransactional()) {
                     // this is an idempotent producer, so make sure we have a producer id
                     maybeWaitForProducerId();
@@ -306,9 +302,9 @@ public class Sender implements Runnable {
                     transactionManager.transitionToFatalError(
                         new KafkaException("The client hasn't received acknowledgment for " +
                             "some previously sent messages and can no longer retry them. It isn't safe to continue."));
-                } else if (transactionManager.hasInFlightTransactionalRequest() || maybeSendTransactionalRequest(now)) {
+                } else if (transactionManager.hasInFlightTransactionalRequest() || maybeSendTransactionalRequest()) {
                     // as long as there are outstanding transactional requests, we simply wait for them to return
-                    client.poll(retryBackoffMs, now);
+                    client.poll(retryBackoffMs, time.milliseconds());
                     return;
                 }
 
@@ -318,7 +314,7 @@ public class Sender implements Runnable {
                     RuntimeException lastError = transactionManager.lastError();
                     if (lastError != null)
                         maybeAbortBatches(lastError);
-                    client.poll(retryBackoffMs, now);
+                    client.poll(retryBackoffMs, time.milliseconds());
                     return;
                 } else if (transactionManager.hasAbortableError()) {
                     accumulator.abortUndrainedBatches(transactionManager.lastError());
@@ -330,8 +326,9 @@ public class Sender implements Runnable {
             }
         }
 
-        long pollTimeout = sendProducerData(now);
-        client.poll(pollTimeout, now);
+        long currentTimeMs = time.milliseconds();
+        long pollTimeout = sendProducerData(currentTimeMs);
+        client.poll(pollTimeout, currentTimeMs);
     }
 
     private long sendProducerData(long now) {
@@ -415,7 +412,7 @@ public class Sender implements Runnable {
         return pollTimeout;
     }
 
-    private boolean maybeSendTransactionalRequest(long now) {
+    private boolean maybeSendTransactionalRequest() {
         if (transactionManager.isCompleting() && accumulator.hasIncomplete()) {
             if (transactionManager.isAborting())
                 accumulator.abortUndrainedBatches(new KafkaException("Failing batch since transaction was aborted"));
@@ -452,11 +449,12 @@ public class Sender implements Runnable {
                 if (targetNode != null) {
                     if (nextRequestHandler.isRetry())
                         time.sleep(nextRequestHandler.retryBackoffMs());
+                    long currentTimeMs = time.milliseconds();
                     ClientRequest clientRequest = client.newClientRequest(
-                        targetNode.idString(), requestBuilder, now, true, requestTimeoutMs, nextRequestHandler);
-                    transactionManager.setInFlightTransactionalRequestCorrelationId(clientRequest.correlationId());
+                        targetNode.idString(), requestBuilder, currentTimeMs, true, requestTimeoutMs, nextRequestHandler);
                     log.debug("Sending transactional request {} to node {}", requestBuilder, targetNode);
-                    client.send(clientRequest, now);
+                    client.send(clientRequest, currentTimeMs);
+                    transactionManager.setInFlightCorrelationId(clientRequest.correlationId());
                     return true;
                 }
             } catch (IOException e) {
@@ -692,16 +690,7 @@ public class Sender implements Runnable {
 
     private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response) {
         if (transactionManager != null) {
-            if (transactionManager.hasProducerIdAndEpoch(batch.producerId(), batch.producerEpoch())) {
-                transactionManager
-                    .maybeUpdateLastAckedSequence(batch.topicPartition, batch.baseSequence() + batch.recordCount - 1);
-                log.debug("ProducerId: {}; Set last ack'd sequence number for topic-partition {} to {}",
-                    batch.producerId(),
-                    batch.topicPartition,
-                    transactionManager.lastAckedSequence(batch.topicPartition).orElse(-1));
-            }
-            transactionManager.updateLastAckedOffset(response, batch);
-            transactionManager.removeInFlightBatch(batch);
+            transactionManager.handleCompletedBatch(batch, response);
         }
 
         if (batch.done(response.baseOffset, response.logAppendTime, null)) {
@@ -710,36 +699,20 @@ public class Sender implements Runnable {
         }
     }
 
-    private void failBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response, RuntimeException exception,
+    private void failBatch(ProducerBatch batch,
+                           ProduceResponse.PartitionResponse response,
+                           RuntimeException exception,
                            boolean adjustSequenceNumbers) {
         failBatch(batch, response.baseOffset, response.logAppendTime, exception, adjustSequenceNumbers);
     }
 
-    private void failBatch(ProducerBatch batch, long baseOffset, long logAppendTime, RuntimeException exception,
-        boolean adjustSequenceNumbers) {
+    private void failBatch(ProducerBatch batch,
+                           long baseOffset,
+                           long logAppendTime,
+                           RuntimeException exception,
+                           boolean adjustSequenceNumbers) {
         if (transactionManager != null) {
-            if (exception instanceof OutOfOrderSequenceException
-                    && !transactionManager.isTransactional()
-                    && transactionManager.hasProducerId(batch.producerId())) {
-                log.error("The broker returned {} for topic-partition " +
-                            "{} at offset {}. This indicates data loss on the broker, and should be investigated.",
-                        exception, batch.topicPartition, baseOffset);
-
-                // Reset the transaction state since we have hit an irrecoverable exception and cannot make any guarantees
-                // about the previously committed message. Note that this will discard the producer id and sequence
-                // numbers for all existing partitions.
-                transactionManager.resetProducerId();
-            } else if (exception instanceof ClusterAuthorizationException
-                    || exception instanceof TransactionalIdAuthorizationException
-                    || exception instanceof ProducerFencedException
-                    || exception instanceof UnsupportedVersionException) {
-                transactionManager.transitionToFatalError(exception);
-            } else if (transactionManager.isTransactional()) {
-                transactionManager.transitionToAbortableError(exception);
-            }
-            transactionManager.removeInFlightBatch(batch);
-            if (adjustSequenceNumbers)
-                transactionManager.adjustSequencesDueToFailedBatch(batch);
+            transactionManager.handleFailedBatch(batch, exception, adjustSequenceNumbers);
         }
 
         this.sensors.recordErrors(batch.topicPartition.topic(), batch.recordCount);
